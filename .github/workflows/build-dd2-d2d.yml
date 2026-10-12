@@ -1,0 +1,131 @@
+# Add this single file as .github/workflows/build-dd2-d2d.yml.
+# No local compiler, game files, personal logs, or access-token input is needed.
+name: Build DD2 D2D Buffer Fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-dd2-d2d.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dd2-d2d-bufferfix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_SHA: '0310cdd383593f36093315432fdfe069a02d377f'
+    steps:
+      - name: Download pinned source and apply the one-line fix
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Checked([string]$Exe, [string[]]$Arguments) {
+            & $Exe @Arguments
+            if ($LASTEXITCODE -ne 0) { throw "$Exe failed: exit $LASTEXITCODE" }
+          }
+          Checked git @('-c','core.autocrlf=false','clone','--no-checkout','https://github.com/cursey/reframework-d2d.git','source')
+          Checked git @('-C','source','config','core.autocrlf','false')
+          Checked git @('-C','source','checkout','--detach',$env:UPSTREAM_SHA)
+          $head = & git -C source rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head.Trim() -ne $env:UPSTREAM_SHA) { throw 'Unexpected source commit' }
+          $header = Join-Path $env:GITHUB_WORKSPACE 'source/src/D3D12Renderer.hpp'
+          $blob = & git -C source hash-object --no-filters $header
+          if ($LASTEXITCODE -ne 0 -or $blob.Trim() -ne '319ad213a1d9866f02cc271575974f101b4d7e7d') {
+            throw 'Unexpected original header; patch refused'
+          }
+          $text = [IO.File]::ReadAllText($header)
+          $pattern = '(?m)^        D2D,$'
+          if ([regex]::Matches($text, $pattern).Count -ne 1) { throw 'Expected exactly one D2D enum entry' }
+          $text = [regex]::Replace($text, $pattern, '        D2D = 16, // Reserve backbuffer slots 0..15; keep D2D separate.')
+          [IO.File]::WriteAllText($header, $text, [Text.UTF8Encoding]::new($false))
+          $expected = '86be8edbdd6eb5591857a49766a86b1991b0dc353d57678d03e6dd12239457ac'
+          if ((Get-FileHash -LiteralPath $header -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Patched header does not match the reviewed patch'
+          }
+          Checked git @('-C','source','diff','--check')
+          $diff = & git -C source diff -- src/D3D12Renderer.hpp
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to record patch' }
+          $diff | Set-Content -LiteralPath 'd2d-buffer-fix.patch' -Encoding utf8
+
+      - name: Configure x64 with Visual Studio 2022
+        run: |
+          cmake -S source -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+
+      - name: Build DLL
+        run: |
+          cmake --build build --config RelWithDebInfo --target reframework-d2d --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'DLL build failed' }
+
+      - name: Check x64 DLL format and package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'build/RelWithDebInfo/reframework-d2d.dll'
+          if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { throw 'Expected DLL is missing' }
+          $b = [IO.File]::ReadAllBytes($dll)
+          if ($b.Length -lt 512 -or [BitConverter]::ToUInt16($b, 0) -ne 0x5A4D) { throw 'Invalid DOS header' }
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          if ($pe -lt 0x40 -or $pe -gt $b.Length - 26) { throw 'Invalid PE offset' }
+          if ([BitConverter]::ToUInt32($b, $pe) -ne 0x4550) { throw 'Invalid PE signature' }
+          if ([BitConverter]::ToUInt16($b, $pe + 4) -ne 0x8664) { throw 'Not an AMD64 binary' }
+          if ([BitConverter]::ToUInt16($b, $pe + 24) -ne 0x20B) { throw 'Not PE32+' }
+          if (([BitConverter]::ToUInt16($b, $pe + 22) -band 0x2000) -eq 0) { throw 'Not a DLL' }
+          New-Item -ItemType Directory -Force -Path 'package/reframework/plugins','package/debug','package/licenses' | Out-Null
+          Copy-Item -LiteralPath $dll -Destination 'package/reframework/plugins/reframework-d2d.dll'
+          $pdb = 'build/RelWithDebInfo/reframework-d2d.pdb'
+          if (Test-Path -LiteralPath $pdb) { Copy-Item -LiteralPath $pdb -Destination 'package/debug/' }
+          Copy-Item -LiteralPath 'source/LICENSE' -Destination 'package/licenses/reframework-d2d-MIT.txt'
+          Copy-Item -LiteralPath 'd2d-buffer-fix.patch' -Destination 'package/'
+          # Preserve notices for the downloaded libraries, including Lua's header notice.
+          $depRoot = Join-Path $env:GITHUB_WORKSPACE 'build/_deps'
+          foreach ($dep in (Get-ChildItem -LiteralPath $depRoot -Directory | Where-Object Name -Like '*-src')) {
+            foreach ($name in @('LICENSE','LICENSE.txt','LICENSE.md','COPYING','COPYING.txt','lua.h')) {
+              $notice = Join-Path $dep.FullName $name
+              if (Test-Path -LiteralPath $notice -PathType Leaf) {
+                Copy-Item -LiteralPath $notice -Destination (Join-Path 'package/licenses' ($dep.Name + '-' + $name))
+              }
+            }
+          }
+          $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  reframework/plugins/reframework-d2d.dll" | Set-Content 'package/SHA256SUMS.txt' -Encoding utf8
+          @(
+            'Unofficial DD2 D2D BufferFix test build',
+            'Upstream: cursey/reframework-d2d',
+            "Upstream commit: $env:UPSTREAM_SHA",
+            'Change: D2D enum entry moved from slot 4 to slot 16; COUNT becomes 17.',
+            'Configuration: Windows x64, VS 2022, RelWithDebInfo; upstream dependency versions.',
+            "Workflow commit: $env:GITHUB_SHA",
+            "Build run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
+            "DLL SHA256: $hash",
+            'Build/link: PASS. AMD64 PE32+ DLL format: PASS.',
+            'NOT TESTED: DLL loading in REFramework, in-game rendering, OptiScaler compatibility.',
+            'NOT CONFIRMED: This source bug is the cause of the reported crash.',
+            'Not based on an HDR/custom fork. Do not replace a custom fork with this build.'
+          ) | Set-Content 'package/BUILD-INFO.txt' -Encoding utf8
+          @(
+            '게임을 완전히 종료하세요.',
+            '기존 reframework\plugins\reframework-d2d.dll을 plugins 밖의 폴더에 백업하세요.',
+            '이 ZIP의 reframework\plugins\reframework-d2d.dll 하나만 같은 위치에 교체하세요.',
+            'OptiScaler, REFramework 본체, 기존 Lua와 설정은 변경하지 마세요.',
+            'HDR 지원판 또는 별도 수정판 D2D를 사용 중이면 이 원본 기반 DLL로 교체하지 마세요.',
+            '이 DLL은 비공식 시험 빌드입니다. 실제 게임에서의 충돌 해결은 검증하지 않았습니다.',
+            '문제가 있으면 게임을 종료하고 백업 DLL로 되돌리세요.'
+          ) | Set-Content 'package/INSTALL_KO.txt' -Encoding utf8
+          "## DLL build and PE format checks passed`n`nSHA256: $hash`n`nIn-game testing has NOT been performed. Download the artifact below." | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload DLL package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: DD2-D2D-BufferFix-x64
+          path: package/
+          if-no-files-found: error
+          retention-days: 7
